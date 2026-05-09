@@ -1,6 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
+import socket
 from typing import List, NamedTuple, Union
 
 import torch
@@ -12,7 +14,10 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    MLATokenToKVPoolHost,
+    SharedMemoryHostTensorAllocator,
+)
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
@@ -51,7 +56,9 @@ class HiSparseCoordinator:
         device_buffer_size: int,
         device: str,
         tp_group,
+        tp_group_src_rank: int = 0,
         host_to_device_ratio: int = 2,
+        share_host_pool: bool = True,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -59,15 +66,33 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
+        self.tp_group = tp_group
+        self.tp_group_src_rank = tp_group_src_rank
+        self.share_host_pool_config = share_host_pool
+        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.tp_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+        self.share_host_pool = self._should_share_host_pool()
+        self.is_host_pool_owner = (not self.share_host_pool) or (
+            self.tp_rank_in_group == 0
+        )
 
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
+        )
+        host_tensor_allocator, verify_host_memory = (
+            self._make_shared_host_tensor_allocator("dsv4")
+            if self.is_dsv4_hisparse
+            else self._make_shared_host_tensor_allocator("mla")
         )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             host_size = self.token_to_kv_pool_allocator.size_full // self.compress_ratio
             self.mem_pool_host = DeepSeekV4SingleKVPoolHost(
-                self.mem_pool_device, host_size, 1
+                self.mem_pool_device,
+                host_size,
+                1,
+                host_tensor_allocator=host_tensor_allocator,
+                verify_host_memory=verify_host_memory,
             )
             self.item_size_bytes = (
                 self.mem_pool_host.kv_cache_total_dim
@@ -87,6 +112,8 @@ class HiSparseCoordinator:
                 page_size=1,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                host_tensor_allocator=host_tensor_allocator,
+                verify_host_memory=verify_host_memory,
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
 
@@ -122,9 +149,6 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
-
-        self.tp_group = tp_group
-        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
@@ -167,6 +191,91 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
+    def _should_share_host_pool(self) -> bool:
+        if not self.share_host_pool_config:
+            return False
+        if self.tp_world_size <= 1:
+            return False
+
+        hostnames = [None] * self.tp_world_size
+        torch.distributed.all_gather_object(
+            hostnames, socket.gethostname(), group=self.tp_group
+        )
+        if len(set(hostnames)) != 1:
+            if self.tp_rank_in_group == 0:
+                logger.warning(
+                    "HiSparse shared host pool is only supported within one host. "
+                    "Falling back to per-rank host pools for TP group hosts: %s",
+                    hostnames,
+                )
+            return False
+        return True
+
+    def _make_shared_host_tensor_allocator(self, pool_name: str):
+        if not self.share_host_pool:
+            return None, True
+
+        run_id = os.environ.get("SGLANG_RUN_ID", "sglang-run")
+        base_name = f"{run_id}_hisparse_{pool_name}_tp{self.tp_group_src_rank}"
+        base_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in base_name)
+        if self.tp_rank_in_group == 0:
+            logger.info(
+                "Creating shared HiSparse host KV pool %s for %d TP ranks.",
+                base_name,
+                self.tp_world_size,
+            )
+        else:
+            logger.info("Mapping shared HiSparse host KV pool %s.", base_name)
+
+        return (
+            SharedMemoryHostTensorAllocator(
+                base_name=base_name,
+                create=self.tp_rank_in_group == 0,
+                group=self.tp_group,
+                src_rank=self.tp_group_src_rank,
+            ),
+            self.tp_rank_in_group == 0,
+        )
+
+    def alloc_host_indices(self, need_size: int) -> Union[torch.Tensor, None]:
+        if need_size == 0:
+            return torch.empty(0, dtype=torch.int64, device="cpu")
+        if not self.share_host_pool:
+            return self.mem_pool_host.alloc(need_size)
+
+        if self.tp_rank_in_group == 0:
+            host_indices = self.mem_pool_host.alloc(need_size)
+            numel = -1 if host_indices is None else len(host_indices)
+            numel_tensor = torch.tensor([numel], dtype=torch.int64, device="cpu")
+        else:
+            host_indices = None
+            numel_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
+
+        torch.distributed.broadcast(
+            numel_tensor,
+            src=self.tp_group_src_rank,
+            group=self.tp_group,
+        )
+        numel = int(numel_tensor.item())
+        if numel < 0:
+            return None
+
+        if self.tp_rank_in_group != 0:
+            host_indices = torch.empty(numel, dtype=torch.int64, device="cpu")
+        torch.distributed.broadcast(
+            host_indices,
+            src=self.tp_group_src_rank,
+            group=self.tp_group,
+        )
+        if self.tp_rank_in_group != 0:
+            self.mem_pool_host.reserve_allocated(host_indices)
+        return host_indices
+
+    def free_host_indices(self, host_indices: torch.Tensor) -> int:
+        if host_indices.numel() == 0:
+            return 0
+        return self.mem_pool_host.free(host_indices)
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -200,7 +309,7 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        host_indices = self.mem_pool_host.alloc(prefill_len)
+        host_indices = self.alloc_host_indices(prefill_len)
         if host_indices is None:
             logger.error(
                 "HiSparse: host mem pool alloc failed for %d tokens (req %s)",
@@ -549,7 +658,7 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
-        host_locs = self.mem_pool_host.alloc(len(device_locs))
+        host_locs = self.alloc_host_indices(len(device_locs))
         if host_locs is None:
             logger.error(
                 "HiSparse: host mem pool alloc failed for %d decode backup tokens",
@@ -706,7 +815,7 @@ class HiSparseCoordinator:
         host_indices = self.req_to_host_pool[req.req_pool_idx, :compressed_len]
         host_indices = host_indices[host_indices >= 0]
         if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
+            self.free_host_indices(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
@@ -751,7 +860,7 @@ class HiSparseCoordinator:
         host_indices = self.req_to_host_pool[req.req_pool_idx, :compressed_len]
         host_indices = host_indices[host_indices >= 0]
         if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
+            self.free_host_indices(host_indices)
 
         # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1

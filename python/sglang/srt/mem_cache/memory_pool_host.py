@@ -6,6 +6,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
+from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
@@ -91,6 +92,91 @@ class HostTensorAllocator(abc.ABC):
         return tensor
 
 
+class SharedMemoryHostTensorAllocator(HostTensorAllocator):
+    def __init__(
+        self,
+        *,
+        base_name: str,
+        create: bool,
+        group=None,
+        src_rank: int = 0,
+    ):
+        super().__init__()
+        self.base_name = base_name
+        self.create = create
+        self.group = group
+        self.src_rank = src_rank
+        self._operation_index = 0
+        self._records = []
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        """Map a tensor backed by POSIX shared memory."""
+        assert device == "cpu", "Shared host tensors must be CPU tensors"
+        self.dtype = dtype
+        self.dims = dims
+        self._operation_index += 1
+        shm_name = f"{self.base_name}_op{self._operation_index}"
+        numel = int(np.prod(dims))
+        num_bytes = numel * torch.empty((), dtype=dtype).element_size()
+
+        if self.group is not None:
+            if self.create:
+                try:
+                    shm = shared_memory.SharedMemory(
+                        name=shm_name, create=True, size=num_bytes
+                    )
+                    status = [("ok", shm_name, num_bytes)]
+                except BaseException as e:
+                    shm = None
+                    status = [("error", repr(e))]
+                torch.distributed.broadcast_object_list(
+                    status, src=self.src_rank, group=self.group
+                )
+                if status[0][0] != "ok":
+                    raise RuntimeError(
+                        f"Failed to create shared host memory {shm_name}: {status[0][1]}"
+                    )
+            else:
+                status = [None]
+                torch.distributed.broadcast_object_list(
+                    status, src=self.src_rank, group=self.group
+                )
+                if status[0][0] != "ok":
+                    raise RuntimeError(
+                        f"Failed to create shared host memory {shm_name}: {status[0][1]}"
+                    )
+                _, shm_name, expected_num_bytes = status[0]
+                assert expected_num_bytes == num_bytes, (
+                    f"Shared memory size mismatch for {shm_name}: "
+                    f"{expected_num_bytes} != {num_bytes}"
+                )
+                shm = shared_memory.SharedMemory(name=shm_name)
+        elif self.create:
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=num_bytes)
+        else:
+            shm = shared_memory.SharedMemory(name=shm_name)
+            assert shm.size >= num_bytes, (
+                f"Shared memory segment {shm_name} is too small: "
+                f"{shm.size} < {num_bytes}"
+            )
+
+        tensor = torch.frombuffer(shm.buf, dtype=dtype, count=numel).reshape(dims)
+        self._records.append((shm, tensor))
+        return tensor
+
+    def __del__(self):
+        for shm, _ in getattr(self, "_records", []):
+            try:
+                shm.close()
+            except BufferError:
+                pass
+            if self.create:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+
+
 def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
         try:
@@ -164,13 +250,17 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        host_tensor_allocator: Optional[HostTensorAllocator] = None,
+        verify_host_memory: bool = True,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = host_tensor_allocator or get_allocator_from_storage(
+            allocator_type
+        )
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -188,20 +278,25 @@ class HostKVCache(abc.ABC):
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
+        if verify_host_memory:
+            # Verify there is enough available host memory.
+            host_mem = psutil.virtual_memory()
+            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                    f"size of the hierarchical cache."
+                )
+            else:
+                logger.info(
+                    f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                )
         else:
             logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                f"Mapping {requested_bytes / 1e9:.2f} GB shared host memory for hierarchical KV cache."
             )
 
         self.kv_buffer = self.init_kv_buffer()
@@ -286,6 +381,27 @@ class HostKVCache(abc.ABC):
     def free(self, indices: torch.Tensor) -> int:
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
+
+    @synchronized
+    def reserve_allocated(self, indices: torch.Tensor) -> None:
+        """Mirror an allocation decided by another rank."""
+        indices = indices.cpu()
+        if indices.numel() == 0:
+            return
+        if len(self.free_slots) >= len(indices) and torch.equal(
+            self.free_slots[: len(indices)], indices
+        ):
+            self.free_slots = self.free_slots[len(indices) :]
+            return
+
+        keep_mask = ~torch.isin(self.free_slots, indices)
+        removed = len(self.free_slots) - int(keep_mask.sum().item())
+        if removed != len(indices):
+            raise RuntimeError(
+                f"Shared host pool allocation state diverged: "
+                f"expected to reserve {len(indices)} slots, removed {removed}."
+            )
+        self.free_slots = self.free_slots[keep_mask]
 
 
 class MHATokenToKVPoolHost(HostKVCache):
@@ -799,6 +915,8 @@ class MLATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        host_tensor_allocator: Optional[HostTensorAllocator] = None,
+        verify_host_memory: bool = True,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -810,6 +928,8 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            host_tensor_allocator=host_tensor_allocator,
+            verify_host_memory=verify_host_memory,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize

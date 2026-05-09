@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import HostTensorAllocator
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -394,6 +395,8 @@ class DeepSeekV4SingleKVPoolHost:
         page_size: int,
         pin_memory: bool = True,
         device: str = "cpu",
+        host_tensor_allocator: Optional[HostTensorAllocator] = None,
+        verify_host_memory: bool = True,
     ):
 
         assert host_size > 0, "Host size must be specified and greater than 0"
@@ -405,6 +408,8 @@ class DeepSeekV4SingleKVPoolHost:
         self.num_pages = (self.size + self.page_size - 1) // self.page_size
         self.pin_memory = pin_memory
         self.device = device
+        self.allocator = host_tensor_allocator
+        self.verify_host_memory = verify_host_memory
 
         self.dtype = device_pool.store_dtype
         self.layer_num = device_pool.layer_num
@@ -432,23 +437,33 @@ class DeepSeekV4SingleKVPoolHost:
             * self.kv_cache_total_dim
             * self.dtype.itemsize
         )
-        host_mem = psutil.virtual_memory()
-        # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
+        if self.verify_host_memory:
+            host_mem = psutil.virtual_memory()
+            # preserve at least 10GB for other usage
+            ten_gb = 10 * (1024**3)
+            available_bytes = host_mem.available - ten_gb
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                    f"size of the hierarchical cache."
+                )
+            else:
+                logger.info(
+                    f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                )
         else:
             logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                f"Mapping {requested_bytes / 1e9:.2f} GB shared host memory for hierarchical KV cache."
             )
 
-        host_pool = torch.empty(dims, dtype=self.dtype, device=self.device)
+        if self.allocator is None:
+            host_pool = torch.empty(dims, dtype=self.dtype, device=self.device)
+        else:
+            host_pool = self.allocator.allocate(
+                dims, dtype=self.dtype, device=self.device
+            )
         assert self.pin_memory, "DeepSeekV4SingleKVPoolHost requires pin_memory=True"
         if self.pin_memory:
             torch.cuda.cudart().cudaHostRegister(
@@ -498,6 +513,25 @@ class DeepSeekV4SingleKVPoolHost:
     def free(self, indices: torch.Tensor) -> int:
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
+
+    def reserve_allocated(self, indices: torch.Tensor) -> None:
+        indices = indices.cpu()
+        if indices.numel() == 0:
+            return
+        if len(self.free_slots) >= len(indices) and torch.equal(
+            self.free_slots[: len(indices)], indices
+        ):
+            self.free_slots = self.free_slots[len(indices) :]
+            return
+
+        keep_mask = ~torch.isin(self.free_slots, indices)
+        removed = len(self.free_slots) - int(keep_mask.sum().item())
+        if removed != len(indices):
+            raise RuntimeError(
+                f"Shared host pool allocation state diverged: "
+                f"expected to reserve {len(indices)} slots, removed {removed}."
+            )
+        self.free_slots = self.free_slots[keep_mask]
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

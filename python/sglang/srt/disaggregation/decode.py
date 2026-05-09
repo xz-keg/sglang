@@ -1033,7 +1033,7 @@ class DecodePreallocQueue:
                 extend_num_tokens=fill_len,
             )
             # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
+            host_indices = coordinator.alloc_host_indices(fill_len)
             if host_indices is None:
                 raise RuntimeError(
                     f"HiSparse host mem pool alloc failed for {fill_len} tokens "

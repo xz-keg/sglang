@@ -769,18 +769,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 hisparse_top_k = getattr(
                     self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
                 )
+                hisparse_tp_group = (
+                    self.attention_tp_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_group
+                )
                 self.hisparse_coordinator = HiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     top_k=hisparse_top_k,
                     device_buffer_size=hisparse_cfg.device_buffer_size,
                     device=self.device,
-                    tp_group=(
-                        self.attention_tp_group.cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_group.cpu_group
-                    ),
+                    tp_group=hisparse_tp_group.cpu_group,
+                    tp_group_src_rank=hisparse_tp_group.ranks[0],
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    share_host_pool=hisparse_cfg.share_host_pool,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
