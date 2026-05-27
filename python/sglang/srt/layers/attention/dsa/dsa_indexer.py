@@ -184,19 +184,6 @@ def _get_indexer_topk_partition_range(
     return start, end
 
 
-def _get_local_indexer_topk_range(num_rows: int) -> Tuple[int, int]:
-    if num_rows == 0 or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
-        return 0, num_rows
-
-    group = get_attn_tp_group()
-    if group.world_size == 1:
-        return 0, num_rows
-
-    return _get_indexer_topk_partition_range(
-        num_rows, group.rank_in_group, group.world_size
-    )
-
-
 def _broadcast_indexer_topk_partitions(
     topk_indices: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
@@ -625,6 +612,9 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
+        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
+        # otherwise fall back to computing it here.
+        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
         # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
         # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
@@ -633,6 +623,11 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
+        if _is_cuda:
+            if schedule_metadata is None:
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, blocksize, self.sm_count
+                )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -649,92 +644,104 @@ class Indexer(MultiPlatformOp):
         # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
-        if envs.SGLANG_DSA_TOPK_BROADCAST.get():
-            partition_start, partition_end = _get_local_indexer_topk_range(
-                q_fp8.shape[0]
-            )
-            compute_start = min(partition_start, q_offset)
-            compute_end = min(partition_end, q_offset)
-        else:
-            compute_start, compute_end = 0, q_offset
+        shard_end = getattr(metadata.attn_metadata, "paged_mqa_shard_end", None)
+        shard_schedule_metadata = getattr(
+            metadata.attn_metadata, "paged_mqa_shard_schedule_metadata", None
+        )
+        shard_start = getattr(metadata.attn_metadata, "paged_mqa_shard_start", 0)
+        use_sharded_paged_decode = (
+            envs.SGLANG_DSA_TOPK_BROADCAST.get()
+            and _is_cuda
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and q_offset == q_fp8.shape[0]
+            and shard_end is not None
+            and (shard_start == shard_end or shard_schedule_metadata is not None)
+            and self.index_topk == 2048
+            and getattr(metadata, "topk_backend", None) is not None
+            and metadata.topk_backend.is_sgl_kernel()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not getattr(metadata, "force_unfused_topk", False)
+        )
+        if use_sharded_paged_decode:
+            from sgl_kernel import fast_topk_transform_fused
 
-        if compute_start == compute_end:
-            return torch.full(
+            compute_start = min(shard_start, q_offset)
+            compute_end = min(shard_end, q_offset)
+            topk_result = torch.full(
                 (q_fp8.shape[0], self.index_topk),
                 -1,
-                dtype=torch.int32,
                 device=q_fp8.device,
+                dtype=torch.int32,
             )
+            if compute_start == compute_end:
+                return topk_result
 
-        local_q_fp8 = q_fp8[compute_start:compute_end]
-        local_weights = weights[compute_start:compute_end]
-        local_seqlens_32 = seqlens_32[compute_start:compute_end]
-        local_seqlens_32_2d = seqlens_32_2d[compute_start:compute_end]
-        local_block_tables = block_tables[compute_start:compute_end]
+            local_q_fp8 = q_fp8[compute_start:compute_end]
+            local_weights = weights[compute_start:compute_end]
+            local_seqlens_32 = seqlens_32[compute_start:compute_end]
+            local_seqlens_32_2d = seqlens_32_2d[compute_start:compute_end]
+            local_block_tables = block_tables[compute_start:compute_end]
 
-        if _is_hip:
-            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-
-            batch_size, next_n, heads, _ = local_q_fp8.shape
-            logits = torch.empty(
-                (batch_size * next_n, max_seq_len),
-                device=local_q_fp8.device,
-                dtype=torch.float32,
-            )
-            deepgemm_fp8_paged_mqa_logits(
-                local_q_fp8,
-                kv_cache_fp8,
-                local_weights,
-                logits,
-                local_seqlens_32,
-                local_block_tables,
-                max_seq_len,
-                Preshuffle=_use_aiter_preshuffle,
-                KVBlockSize=block_kv,
-            )
-        else:
-            schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-            if compute_start != 0 or compute_end != q_offset:
-                schedule_metadata = None
-            if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    local_seqlens_32_2d, blocksize, self.sm_count
-                )
             logits = deep_gemm.fp8_paged_mqa_logits(
                 local_q_fp8,
                 kv_cache_fp8,
                 local_weights,
                 local_seqlens_32_2d,
                 local_block_tables,
+                shard_schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
+            local_num_rows = compute_end - compute_start
+            local_topk_result = fast_topk_transform_fused(
+                score=logits,
+                lengths=local_seqlens_32,
+                page_table_size_1=metadata.get_page_table_1()[
+                    compute_start:compute_end
+                ],
+                cu_seqlens_q=metadata.attn_metadata.cu_seqlens_q[: local_num_rows + 1],
+                topk=self.index_topk,
+            )
+            topk_result[compute_start:compute_end] = local_topk_result
+            return topk_result
+
+        if _is_hip:
+            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+            batch_size, next_n, heads, _ = q_fp8.shape
+            logits = torch.empty(
+                (batch_size * next_n, max_seq_len),
+                device=q_fp8.device,
+                dtype=torch.float32,
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                logits,
+                seqlens_32,
+                block_tables,
+                max_seq_len,
+                Preshuffle=_use_aiter_preshuffle,
+                KVBlockSize=block_kv,
+            )
+        else:
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
                 schedule_metadata,
                 max_seq_len,
                 clean_logits=False,
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        if compute_start == 0 and compute_end == q_offset:
-            topk_result = metadata.topk_transform(logits, self.index_topk)
-        else:
-            local_cu_seqlens_q = torch.ones(
-                compute_end - compute_start, dtype=torch.int32, device=q_fp8.device
-            )
-            local_topk_result = metadata.topk_transform(
-                logits,
-                self.index_topk,
-                cu_seqlens_q=local_cu_seqlens_q,
-                ke_offset=local_seqlens_32,
-                batch_idx_list=list(range(compute_start, compute_end)),
-            )
-            topk_result = torch.full(
-                (q_fp8.shape[0], self.index_topk),
-                -1,
-                dtype=local_topk_result.dtype,
-                device=q_fp8.device,
-            )
-            topk_result[compute_start:compute_end] = local_topk_result
+        topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and topk_result.shape[0] < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - topk_result.shape[0]
+        if not _is_hip and q_offset < q_fp8.shape[0]:
+            pad_len = q_fp8.shape[0] - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
                 -1,
@@ -883,19 +890,78 @@ class Indexer(MultiPlatformOp):
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
-        if envs.SGLANG_DSA_TOPK_BROADCAST.get():
-            # Partition by final output rows, then clamp to valid query rows.
-            # This keeps ownership consistent when CUDA graph padding adds rows
-            # beyond q_offset.
-            partition_start, partition_end = _get_local_indexer_topk_range(
-                topk_result.shape[0]
-            )
-            compute_start = min(partition_start, q_offset)
-            compute_end = min(partition_end, q_offset)
-        else:
-            compute_start, compute_end = 0, q_offset
+        global_topk_offset = metadata.attn_metadata.topk_indices_offset
+        group = get_attn_tp_group()
+        use_sharded_ragged = (
+            envs.SGLANG_DSA_TOPK_BROADCAST.get()
+            and _is_cuda
+            and group.world_size > 1
+            and global_topk_offset is not None
+            and q_offset == q_fp8.shape[0]
+            and q_offset == topk_result.shape[0]
+        )
 
-        if not need_chunk and compute_start == 0 and compute_end == q_offset:
+        if use_sharded_ragged:
+            shard_start, shard_end = _get_indexer_topk_partition_range(
+                topk_result.shape[0], group.rank_in_group, group.world_size
+            )
+            compute_start = min(shard_start, q_offset)
+            compute_end = min(shard_end, q_offset)
+            if compute_start == compute_end:
+                return topk_result
+
+            if not need_chunk:
+                with self._with_real_sm_count():
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8[compute_start:compute_end],
+                        kv_fp8,
+                        weights[compute_start:compute_end],
+                        ks[compute_start:compute_end],
+                        ke[compute_start:compute_end],
+                        clean_logits=False,
+                    )
+                lengths_chunk = seq_lens_expanded[compute_start:compute_end]
+                raw_topk_result = metadata.topk_transform(
+                    logits,
+                    self.index_topk,
+                    ks=ks[compute_start:compute_end],
+                    ke_offset=lengths_chunk,
+                    topk_indices_offset_override=global_topk_offset[
+                        compute_start:compute_end
+                    ],
+                )
+                topk_result[compute_start:compute_end] = raw_topk_result
+                return topk_result
+
+            bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+            max_rows = min(max_rows, compute_end - compute_start)
+
+            start = compute_start
+            while start < compute_end:
+                end = min(start + max_rows, compute_end)
+                with self._with_real_sm_count():
+                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
+                    )
+                lengths_chunk = seq_lens_expanded[start:end]
+                raw_topk_chunk = metadata.topk_transform(
+                    logits_chunk,
+                    self.index_topk,
+                    ks=ks[start:end],
+                    ke_offset=lengths_chunk,
+                    topk_indices_offset_override=global_topk_offset[start:end],
+                )
+                topk_result[start:end] = raw_topk_chunk
+                start = end
+            return topk_result
+
+        if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
@@ -921,17 +987,10 @@ class Indexer(MultiPlatformOp):
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
-        if compute_start == compute_end:
-            return topk_result
+        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+        max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+        max_rows = min(max_rows, q_offset)
 
-        if need_chunk:
-            bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
-            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
-            max_rows = min(max_rows, q_offset)
-        else:
-            max_rows = compute_end - compute_start
-
-        global_topk_offset = metadata.attn_metadata.topk_indices_offset
         cu_seqlens_q_full = None
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
@@ -944,9 +1003,9 @@ class Indexer(MultiPlatformOp):
                 global_topk_offset.shape[0] >= q_offset
             ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
 
-        start = compute_start
-        while start < compute_end:
-            end = min(start + max_rows, compute_end)
+        start = 0
+        while start < q_offset:
+            end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
                 if _is_hip:

@@ -17,6 +17,7 @@ import torch
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 
 logger = logging.getLogger(__name__)
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -153,6 +154,9 @@ class DSAMetadata:
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    paged_mqa_shard_start: int = 0
+    paged_mqa_shard_end: Optional[int] = None
+    paged_mqa_shard_schedule_metadata: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -191,6 +195,56 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     torch._dynamo.mark_dynamic(qk_rope, 0)
 
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
+
+
+def _get_indexer_topk_partition_range(
+    num_rows: int, rank: int, world_size: int
+) -> Tuple[int, int]:
+    rows_per_rank = num_rows // world_size
+    remainder = num_rows % world_size
+    start = rank * rows_per_rank + min(rank, remainder)
+    end = start + rows_per_rank + (1 if rank < remainder else 0)
+    return start, end
+
+
+def _get_paged_mqa_shard_schedule_metadata(
+    seqlens_32_2d: torch.Tensor,
+    blocksize: int,
+    num_sms: int,
+) -> Tuple[int, Optional[int], Optional[torch.Tensor]]:
+    if not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        return 0, None, None
+
+    group = get_attn_tp_group()
+    if group.world_size == 1:
+        return 0, None, None
+
+    shard_start, shard_end = _get_indexer_topk_partition_range(
+        seqlens_32_2d.shape[0], group.rank_in_group, group.world_size
+    )
+    if shard_start == shard_end:
+        return shard_start, shard_end, None
+
+    import deep_gemm
+
+    shard_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        seqlens_32_2d[shard_start:shard_end],
+        blocksize,
+        num_sms,
+    )
+    return shard_start, shard_end, shard_schedule_metadata
+
+
+def _set_or_copy_metadata_tensor(
+    metadata: "DSAMetadata",
+    field: str,
+    value: Optional[torch.Tensor],
+) -> None:
+    current_value = getattr(metadata, field)
+    if value is None or current_value is None:
+        object.__setattr__(metadata, field, value)
+    else:
+        current_value.copy_(value)
 
 
 @dataclass(frozen=True)
@@ -635,6 +689,9 @@ class DeepseekSparseAttnBackend(
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
         paged_mqa_schedule_metadata = None
+        paged_mqa_shard_start = 0
+        paged_mqa_shard_end = None
+        paged_mqa_shard_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
         if is_cuda() and (
@@ -660,8 +717,17 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
+                if forward_batch.forward_mode.is_decode_or_idle():
+                    (
+                        paged_mqa_shard_start,
+                        paged_mqa_shard_end,
+                        paged_mqa_shard_schedule_metadata,
+                    ) = _get_paged_mqa_shard_schedule_metadata(
+                        seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
+                paged_mqa_shard_schedule_metadata = None
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -682,6 +748,9 @@ class DeepseekSparseAttnBackend(
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_shard_start=paged_mqa_shard_start,
+            paged_mqa_shard_end=paged_mqa_shard_end,
+            paged_mqa_shard_schedule_metadata=paged_mqa_shard_schedule_metadata,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -926,6 +995,9 @@ class DeepseekSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
+        paged_mqa_shard_start = 0
+        paged_mqa_shard_end = None
+        paged_mqa_shard_schedule_metadata = None
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
@@ -946,8 +1018,17 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
+                if forward_mode.is_decode_or_idle():
+                    (
+                        paged_mqa_shard_start,
+                        paged_mqa_shard_end,
+                        paged_mqa_shard_schedule_metadata,
+                    ) = _get_paged_mqa_shard_schedule_metadata(
+                        seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
+                paged_mqa_shard_schedule_metadata = None
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -959,6 +1040,9 @@ class DeepseekSparseAttnBackend(
             page_table_1=page_table_1,
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_shard_start=paged_mqa_shard_start,
+            paged_mqa_shard_end=paged_mqa_shard_end,
+            paged_mqa_shard_schedule_metadata=paged_mqa_shard_schedule_metadata,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -1097,14 +1181,32 @@ class DeepseekSparseAttnBackend(
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    object.__setattr__(
-                        metadata, "paged_mqa_schedule_metadata", new_schedule
+                _set_or_copy_metadata_tensor(
+                    metadata, "paged_mqa_schedule_metadata", new_schedule
+                )
+                if forward_mode.is_decode_or_idle():
+                    (
+                        shard_start,
+                        shard_end,
+                        shard_schedule,
+                    ) = _get_paged_mqa_shard_schedule_metadata(
+                        seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    )
+                    object.__setattr__(metadata, "paged_mqa_shard_start", shard_start)
+                    object.__setattr__(metadata, "paged_mqa_shard_end", shard_end)
+                    _set_or_copy_metadata_tensor(
+                        metadata,
+                        "paged_mqa_shard_schedule_metadata",
+                        shard_schedule,
                     )
                 else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                    object.__setattr__(metadata, "paged_mqa_shard_end", None)
+                    object.__setattr__(
+                        metadata, "paged_mqa_shard_schedule_metadata", None
+                    )
             except (ImportError, ModuleNotFoundError):
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+                object.__setattr__(metadata, "paged_mqa_shard_schedule_metadata", None)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -1309,12 +1411,29 @@ class DeepseekSparseAttnBackend(
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    object.__setattr__(
-                        metadata, "paged_mqa_schedule_metadata", new_schedule
+                _set_or_copy_metadata_tensor(
+                    metadata, "paged_mqa_schedule_metadata", new_schedule
+                )
+                if forward_mode.is_decode_or_idle():
+                    (
+                        shard_start,
+                        shard_end,
+                        shard_schedule,
+                    ) = _get_paged_mqa_shard_schedule_metadata(
+                        seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    )
+                    object.__setattr__(metadata, "paged_mqa_shard_start", shard_start)
+                    object.__setattr__(metadata, "paged_mqa_shard_end", shard_end)
+                    _set_or_copy_metadata_tensor(
+                        metadata,
+                        "paged_mqa_shard_schedule_metadata",
+                        shard_schedule,
                     )
                 else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                    object.__setattr__(metadata, "paged_mqa_shard_end", None)
+                    object.__setattr__(
+                        metadata, "paged_mqa_shard_schedule_metadata", None
+                    )
             except (ImportError, ModuleNotFoundError):
                 pass
 
