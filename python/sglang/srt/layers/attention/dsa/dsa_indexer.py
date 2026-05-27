@@ -194,7 +194,14 @@ def _broadcast_indexer_topk_partitions(
     if group.world_size == 1:
         return topk_indices
 
-    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+    use_pynccl = False
+    if topk_indices.device.type == "cuda":
+        if is_in_piecewise_cuda_graph():
+            use_pynccl = True
+        else:
+            use_pynccl = torch.cuda.is_current_stream_capturing()
+
+    if use_pynccl:
         if group.pynccl_comm is None:
             raise RuntimeError(
                 "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
