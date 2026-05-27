@@ -194,27 +194,38 @@ def _broadcast_indexer_topk_partitions(
     if group.world_size == 1:
         return topk_indices
 
+    # Piecewise CUDA graph captures the indexer top-k path inside a custom op.
+    # Keep that path byte-for-byte close to dsa-rk0-broadcast: all ranks compute
+    # the full result and only rank 0 is the source of truth.
+    use_rank0_broadcast = is_in_piecewise_cuda_graph()
+
     if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         if group.pynccl_comm is None:
             raise RuntimeError(
                 "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
             )
         with group.pynccl_comm.change_state(enable=True):
+            if use_rank0_broadcast:
+                group.pynccl_comm.broadcast(topk_indices, src=0)
+            else:
+                for src in range(group.world_size):
+                    start, end = _get_indexer_topk_partition_range(
+                        topk_indices.shape[0], src, group.world_size
+                    )
+                    if start == end:
+                        continue
+                    group.pynccl_comm.broadcast(topk_indices[start:end], src=src)
+    else:
+        if use_rank0_broadcast:
+            group.broadcast(topk_indices, src=0)
+        else:
             for src in range(group.world_size):
                 start, end = _get_indexer_topk_partition_range(
                     topk_indices.shape[0], src, group.world_size
                 )
                 if start == end:
                     continue
-                group.pynccl_comm.broadcast(topk_indices[start:end], src=src)
-    else:
-        for src in range(group.world_size):
-            start, end = _get_indexer_topk_partition_range(
-                topk_indices.shape[0], src, group.world_size
-            )
-            if start == end:
-                continue
-            group.broadcast(topk_indices[start:end], src=src)
+                group.broadcast(topk_indices[start:end], src=src)
     return topk_indices
 
 
@@ -652,6 +663,7 @@ class Indexer(MultiPlatformOp):
         use_sharded_paged_decode = (
             envs.SGLANG_DSA_TOPK_BROADCAST.get()
             and _is_cuda
+            and not is_in_piecewise_cuda_graph()
             and forward_batch.forward_mode.is_decode_or_idle()
             and q_offset == q_fp8.shape[0]
             and shard_end is not None
@@ -895,6 +907,7 @@ class Indexer(MultiPlatformOp):
         use_sharded_ragged = (
             envs.SGLANG_DSA_TOPK_BROADCAST.get()
             and _is_cuda
+            and not is_in_piecewise_cuda_graph()
             and group.world_size > 1
             and global_topk_offset is not None
             and q_offset == q_fp8.shape[0]
