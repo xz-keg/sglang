@@ -142,6 +142,26 @@ if _is_cuda:
             topk_result,
         )
 
+    @register_custom_op(mutates_args=["topk_indices"])
+    @register_split_op()
+    def broadcast_indexer_topk_partitions_pynccl(topk_indices: torch.Tensor) -> None:
+        group = get_attn_tp_group()
+        if group.world_size == 1:
+            return
+        if group.pynccl_comm is None:
+            raise RuntimeError(
+                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
+            )
+
+        with group.pynccl_comm.change_state(enable=True):
+            for src in range(group.world_size):
+                start, end = _get_indexer_topk_partition_range(
+                    topk_indices.shape[0], src, group.world_size
+                )
+                if start == end:
+                    continue
+                group.pynccl_comm.broadcast(topk_indices[start:end], src=src)
+
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -202,18 +222,7 @@ def _broadcast_indexer_topk_partitions(
             use_pynccl = torch.cuda.is_current_stream_capturing()
 
     if use_pynccl:
-        if group.pynccl_comm is None:
-            raise RuntimeError(
-                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
-            )
-        with group.pynccl_comm.change_state(enable=True):
-            for src in range(group.world_size):
-                start, end = _get_indexer_topk_partition_range(
-                    topk_indices.shape[0], src, group.world_size
-                )
-                if start == end:
-                    continue
-                group.pynccl_comm.broadcast(topk_indices[start:end], src=src)
+        broadcast_indexer_topk_partitions_pynccl(topk_indices)
     else:
         for src in range(group.world_size):
             start, end = _get_indexer_topk_partition_range(
