@@ -5,6 +5,7 @@ from typing import List, NamedTuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -12,7 +13,10 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    MLATokenToKVPoolHost,
+    create_shared_memory_host_tensor_allocator,
+)
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
@@ -59,6 +63,8 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
+        self.tp_group = tp_group
+        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
@@ -82,6 +88,15 @@ class HiSparseCoordinator:
             self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )
+            # Opt-in only: keep the default DSA/GLM HiSparse path on private
+            # CPU buffers unless the operator explicitly enables sharing.
+            shared_allocator = (
+                create_shared_memory_host_tensor_allocator(
+                    self.tp_group, "hisparse_dsa_host"
+                )
+                if envs.SGLANG_HISPARSE_CPU_SHARE.get()
+                else None
+            )
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
@@ -89,6 +104,7 @@ class HiSparseCoordinator:
                 page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                allocator=shared_allocator,
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
@@ -128,9 +144,6 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
-
-        self.tp_group = tp_group
-        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
