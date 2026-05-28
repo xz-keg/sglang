@@ -144,9 +144,11 @@ if _is_cuda:
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
-    def broadcast_indexer_topk_partitions_pynccl(topk_indices: torch.Tensor) -> None:
+    def broadcast_indexer_topk_partitions_pynccl(
+        topk_indices: torch.Tensor, is_partitioned: bool
+    ) -> None:
         group = get_attn_tp_group()
-        if group.world_size == 1:
+        if group.world_size == 1 or topk_indices.shape[0] == 0:
             return
         if group.pynccl_comm is None:
             raise RuntimeError(
@@ -154,13 +156,28 @@ if _is_cuda:
             )
 
         with group.pynccl_comm.change_state(enable=True):
-            for src in range(group.world_size):
-                start, end = _get_indexer_topk_partition_range(
-                    topk_indices.shape[0], src, group.world_size
-                )
-                if start == end:
-                    continue
-                group.pynccl_comm.broadcast(topk_indices[start:end], src=src)
+            if not is_partitioned:
+                group.pynccl_comm.broadcast(topk_indices, src=0)
+                return
+
+            if topk_indices.shape[0] % group.world_size == 0:
+                rows_per_rank = topk_indices.shape[0] // group.world_size
+                start = group.rank_in_group * rows_per_rank
+                end = start + rows_per_rank
+                group.pynccl_comm.all_gather(topk_indices, topk_indices[start:end])
+                return
+
+            group.pynccl_comm.group_start()
+            try:
+                for src in range(group.world_size):
+                    start, end = _get_indexer_topk_partition_range(
+                        topk_indices.shape[0], src, group.world_size
+                    )
+                    if start == end:
+                        continue
+                    group.pynccl_comm.broadcast(topk_indices[start:end], src=src)
+            finally:
+                group.pynccl_comm.group_end()
 
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
@@ -206,12 +223,13 @@ def _get_indexer_topk_partition_range(
 
 def _broadcast_indexer_topk_partitions(
     topk_indices: Optional[torch.Tensor],
+    is_partitioned: bool = True,
 ) -> Optional[torch.Tensor]:
     if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
         return topk_indices
 
     group = get_attn_tp_group()
-    if group.world_size == 1:
+    if group.world_size == 1 or topk_indices.shape[0] == 0:
         return topk_indices
 
     use_pynccl = False
@@ -222,7 +240,9 @@ def _broadcast_indexer_topk_partitions(
             use_pynccl = torch.cuda.is_current_stream_capturing()
 
     if use_pynccl:
-        broadcast_indexer_topk_partitions_pynccl(topk_indices)
+        broadcast_indexer_topk_partitions_pynccl(topk_indices, is_partitioned)
+    elif not is_partitioned:
+        group.broadcast(topk_indices, src=0)
     else:
         for src in range(group.world_size):
             start, end = _get_indexer_topk_partition_range(
@@ -592,7 +612,7 @@ class Indexer(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, bool]:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -690,7 +710,7 @@ class Indexer(MultiPlatformOp):
                 dtype=torch.int32,
             )
             if compute_start == compute_end:
-                return topk_result
+                return topk_result, True
 
             local_q_fp8 = q_fp8[compute_start:compute_end]
             local_weights = weights[compute_start:compute_end]
@@ -719,7 +739,7 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
             )
             topk_result[compute_start:compute_end] = local_topk_result
-            return topk_result
+            return topk_result, True
 
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -765,7 +785,7 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
-        return topk_result
+        return topk_result, False
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         free_mem_fraction = self._mqa_logits_free_mem_fraction()
@@ -829,7 +849,7 @@ class Indexer(MultiPlatformOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
         topk_result: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, bool]:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -876,7 +896,7 @@ class Indexer(MultiPlatformOp):
                 (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
             )
         if batch_size == 0:
-            return topk_result
+            return topk_result, False
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
@@ -924,7 +944,7 @@ class Indexer(MultiPlatformOp):
             compute_start = min(shard_start, q_offset)
             compute_end = min(shard_end, q_offset)
             if compute_start == compute_end:
-                return topk_result
+                return topk_result, True
 
             if not need_chunk:
                 with self._with_real_sm_count():
@@ -947,7 +967,7 @@ class Indexer(MultiPlatformOp):
                     ],
                 )
                 topk_result[compute_start:compute_end] = raw_topk_result
-                return topk_result
+                return topk_result, True
 
             bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
             max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
@@ -975,7 +995,7 @@ class Indexer(MultiPlatformOp):
                 )
                 topk_result[start:end] = raw_topk_chunk
                 start = end
-            return topk_result
+            return topk_result, True
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
@@ -1001,7 +1021,7 @@ class Indexer(MultiPlatformOp):
 
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
-            return topk_result
+            return topk_result, False
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
         max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
@@ -1072,7 +1092,7 @@ class Indexer(MultiPlatformOp):
             topk_result[start:end] = raw_topk_chunk
             start = end
 
-        return topk_result
+        return topk_result, False
 
     def _forward_cuda_k_only(
         self,
@@ -1508,7 +1528,9 @@ class Indexer(MultiPlatformOp):
                 metadata,
                 return_indices,
             )
-            topk_result = _broadcast_indexer_topk_partitions(topk_result)
+            topk_result = _broadcast_indexer_topk_partitions(
+                topk_result, is_partitioned=False
+            )
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
@@ -1611,6 +1633,7 @@ class Indexer(MultiPlatformOp):
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
+        topk_result_is_partitioned = False
         if _is_cuda or _is_hip:
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
             # Piecewise CUDA graph never has empty batches.
@@ -1628,7 +1651,9 @@ class Indexer(MultiPlatformOp):
                         dtype=torch.int,
                         device=x_meta.device,
                     )
-                    topk_result = _broadcast_indexer_topk_partitions(topk_result)
+                    topk_result = _broadcast_indexer_topk_partitions(
+                        topk_result, is_partitioned=False
+                    )
                     return maybe_capture_indexer_topk(layer_id, topk_result)
 
             if (
@@ -1636,7 +1661,7 @@ class Indexer(MultiPlatformOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
-                topk_result = self._get_topk_paged(
+                topk_result, topk_result_is_partitioned = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
@@ -1679,7 +1704,9 @@ class Indexer(MultiPlatformOp):
                         actual_seq_q_next,
                     )
                     topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
-                    topk_result = _broadcast_indexer_topk_partitions(topk_result)
+                    topk_result = _broadcast_indexer_topk_partitions(
+                        topk_result, is_partitioned=False
+                    )
                     return maybe_capture_indexer_topk(layer_id, topk_result)
                 elif is_in_piecewise_cuda_graph():
                     assert (
@@ -1699,8 +1726,9 @@ class Indexer(MultiPlatformOp):
                         weights=weights,
                         topk_result=topk_result,
                     )
+                    topk_result_is_partitioned = True
                 else:
-                    topk_result = self._get_topk_ragged(
+                    topk_result, topk_result_is_partitioned = self._get_topk_ragged(
                         enable_dual_stream,
                         forward_batch,
                         layer_id,
@@ -1716,7 +1744,9 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-        topk_result = _broadcast_indexer_topk_partitions(topk_result)
+        topk_result = _broadcast_indexer_topk_partitions(
+            topk_result, topk_result_is_partitioned
+        )
         return maybe_capture_indexer_topk(layer_id, topk_result)
 
     def forward_npu(
