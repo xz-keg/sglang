@@ -65,6 +65,9 @@ class HiSparseCoordinator:
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self._share_cpu_host_cache = False
+        self._write_host_cache = True
+        self._has_pending_shared_backup = False
 
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
@@ -106,6 +109,9 @@ class HiSparseCoordinator:
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
                 allocator=shared_allocator,
             )
+            if shared_allocator is not None:
+                self._share_cpu_host_cache = True
+                self._write_host_cache = shared_allocator.is_writer
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
@@ -232,12 +238,13 @@ class HiSparseCoordinator:
         start_event.record()
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                io_backend="kernel",
-            )
+            if self._write_host_cache:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    io_backend="kernel",
+                )
             finish_event.record()
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
@@ -459,6 +466,13 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.detach().to(device="cpu", dtype=torch.int64)
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.detach().to(
+                device="cpu", dtype=torch.int64
+            )
+
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -577,6 +591,11 @@ class HiSparseCoordinator:
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
+        if self._share_cpu_host_cache:
+            self._has_pending_shared_backup = True
+        if not self._write_host_cache:
+            return
+
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
@@ -600,6 +619,17 @@ class HiSparseCoordinator:
         self._has_pending_backup = True
 
     def wait_for_pending_backup(self) -> None:
+        if not self._has_pending_backup and not self._has_pending_shared_backup:
+            return
+
+        if self._share_cpu_host_cache and self._has_pending_shared_backup:
+            if self._has_pending_backup:
+                self._backup_done_event.synchronize()
+                self._has_pending_backup = False
+            torch.distributed.barrier(group=self.tp_group)
+            self._has_pending_shared_backup = False
+            return
+
         if not self._has_pending_backup:
             return
         self._backup_done_event.wait(device_module.current_stream())

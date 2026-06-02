@@ -5,11 +5,12 @@ import logging
 import math
 import mmap
 import os
+import socket
 import tempfile
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -107,6 +108,7 @@ class SharedMemoryHostTensorAllocator(HostTensorAllocator):
         name_prefix: str,
         directory: Optional[str] = None,
         unlink_after_attach: bool = True,
+        is_writer: Optional[bool] = None,
     ):
         super().__init__()
         self.group = group
@@ -115,6 +117,15 @@ class SharedMemoryHostTensorAllocator(HostTensorAllocator):
         self.unlink_after_attach = unlink_after_attach
         self._alloc_index = 0
         self._mmap_refs = []
+        self._is_writer = is_writer
+
+    @property
+    def is_writer(self) -> bool:
+        return bool(self._is_writer)
+
+    @property
+    def is_writer_configured(self) -> bool:
+        return self._is_writer is not None
 
     @staticmethod
     def _sanitize_name(name: str) -> str:
@@ -136,20 +147,21 @@ class SharedMemoryHostTensorAllocator(HostTensorAllocator):
 
     def _open_or_create(self, path: str, nbytes: int) -> tuple[int, bool]:
         os.makedirs(self.directory, exist_ok=True)
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        if self._is_writer is not False:
             try:
-                os.ftruncate(fd, nbytes)
-            except Exception:
-                os.close(fd)
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
                 try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-                raise
-            return fd, True
-        except FileExistsError:
-            pass
+                    os.ftruncate(fd, nbytes)
+                except Exception:
+                    os.close(fd)
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                    raise
+                return fd, True
+            except FileExistsError:
+                pass
 
         deadline = time.monotonic() + 60
         while True:
@@ -191,6 +203,8 @@ class SharedMemoryHostTensorAllocator(HostTensorAllocator):
         self._alloc_index += 1
 
         fd, created = self._open_or_create(path, nbytes)
+        if self._is_writer is None:
+            self._is_writer = created
         try:
             mapping = mmap.mmap(fd, nbytes, access=mmap.ACCESS_WRITE)
         finally:
@@ -227,7 +241,74 @@ def create_shared_memory_host_tensor_allocator(
     if torch.distributed.get_rank() == src_rank:
         shared_name[0] = f"{namespace}_{uuid.uuid4().hex}"
     torch.distributed.broadcast_object_list(shared_name, src=src_rank, group=group)
-    return SharedMemoryHostTensorAllocator(group=group, name_prefix=shared_name[0])
+
+    hostname = socket.gethostname()
+    hostnames = [None] * len(group_ranks)
+    torch.distributed.all_gather_object(hostnames, hostname, group=group)
+    local_writer_rank = min(
+        rank
+        for rank, rank_hostname in zip(group_ranks, hostnames)
+        if rank_hostname == hostname
+    )
+    return SharedMemoryHostTensorAllocator(
+        group=group,
+        name_prefix=shared_name[0],
+        is_writer=torch.distributed.get_rank() == local_writer_rank,
+    )
+
+
+class CompactHostSlotAllocator:
+    """Queue-compatible host slot allocator without a full int64 free list."""
+
+    def __init__(self, size: int):
+        self.size = size
+        self.available = size
+        self.segments = deque([(0, size)])
+
+    def available_size(self) -> int:
+        return self.available
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size == 0:
+            return torch.empty((0,), dtype=torch.int64)
+        if need_size > self.available:
+            return None
+
+        remaining = need_size
+        pieces = []
+        while remaining > 0:
+            segment = self.segments.popleft()
+            if isinstance(segment, tuple):
+                start, length = segment
+                take = min(remaining, length)
+                pieces.append(torch.arange(start, start + take, dtype=torch.int64))
+                if take < length:
+                    self.segments.appendleft((start + take, length - take))
+            else:
+                take = min(remaining, segment.numel())
+                pieces.append(segment[:take])
+                if take < segment.numel():
+                    self.segments.appendleft(segment[take:])
+            remaining -= take
+
+        self.available -= need_size
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+
+    def free(self, indices: torch.Tensor) -> int:
+        indices = indices.to(dtype=torch.int64, device="cpu").flatten()
+        numel = indices.numel()
+        if numel == 0:
+            return 0
+
+        breaks = torch.nonzero(indices[1:] != indices[:-1] + 1).flatten()
+        start = 0
+        for end in [int(x) + 1 for x in breaks] + [numel]:
+            segment = indices[start:end]
+            self.segments.append((int(segment[0]), segment.numel()))
+            start = end
+
+        self.available += numel
+        return numel
 
 
 class HiSparseHostPoolMixin:
@@ -376,6 +457,11 @@ class HostKVCache(abc.ABC):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = allocator or get_allocator_from_storage(allocator_type)
+        self._use_shared_host_tensor_allocator = isinstance(
+            self.allocator, SharedMemoryHostTensorAllocator
+        )
+        self._use_compact_host_slots = self._use_shared_host_tensor_allocator
+        self._compact_host_slots: Optional[CompactHostSlotAllocator] = None
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -397,7 +483,12 @@ class HostKVCache(abc.ABC):
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
+        is_shared_reader = (
+            self._use_shared_host_tensor_allocator
+            and self.allocator.is_writer_configured
+            and not self.allocator.is_writer
+        )
+        if requested_bytes > available_bytes and not is_shared_reader:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
@@ -405,8 +496,9 @@ class HostKVCache(abc.ABC):
                 f"size of the hierarchical cache."
             )
         else:
+            action = "Attaching to shared" if is_shared_reader else "Allocating"
             logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                f"{action} {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
         self.kv_buffer = self.init_kv_buffer()
@@ -466,12 +558,20 @@ class HostKVCache(abc.ABC):
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
+        if self._use_compact_host_slots:
+            self.mem_state = None
+            self.free_slots = None
+            self._compact_host_slots = CompactHostSlotAllocator(self.size)
+            return
+
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
     def available_size(self):
+        if self._use_compact_host_slots:
+            return self._compact_host_slots.available_size()
         return len(self.free_slots)
 
     @synchronized
@@ -479,6 +579,9 @@ class HostKVCache(abc.ABC):
         assert (
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
+        if self._use_compact_host_slots:
+            return self._compact_host_slots.alloc(need_size)
+
         if need_size > self.available_size():
             return None
 
@@ -489,6 +592,8 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        if self._use_compact_host_slots:
+            return self._compact_host_slots.free(indices)
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
 
