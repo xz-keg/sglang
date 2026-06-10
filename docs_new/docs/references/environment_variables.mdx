@@ -453,7 +453,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HISPARSE_CPU_SHARE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental. When enabled with HiSparse on a single-node TP group, share the HiSparse CPU host KV cache across TP ranks. One TP rank writes the shared host cache while the other TP ranks attach as readers, reducing duplicated CPU KV memory. Multi-node TP groups are not supported.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental. When enabled with HiSparse on a single-node process group, share the HiSparse CPU host KV cache across ranks that serve the same request stream. Without DP attention this is the TP group. With <code>--enable-dp-attention</code>, this is each attention-TP group, so each DP group gets its own shared host cache; DP groups are not merged because they serve different requests. One rank writes the shared host cache while peer ranks attach as readers, reducing duplicated CPU KV memory. Multi-node share groups are not supported.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>

@@ -54,7 +54,8 @@ class HiSparseCoordinator:
         top_k: int,
         device_buffer_size: int,
         device: str,
-        tp_group,
+        cpu_share_group,
+        cpu_share_group_desc: str = "process",
         host_to_device_ratio: int = 2,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -63,8 +64,11 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
-        self.tp_group = tp_group
-        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.cpu_share_group = cpu_share_group
+        self.cpu_share_group_desc = cpu_share_group_desc
+        self.cpu_share_world_size = torch.distributed.get_world_size(
+            group=self.cpu_share_group
+        )
         self._share_cpu_host_cache = False
         self._write_host_cache = True
         self._has_pending_shared_backup = False
@@ -101,7 +105,9 @@ class HiSparseCoordinator:
             )
             shared_allocator = (
                 create_shared_memory_host_tensor_allocator(
-                    self.tp_group, "hisparse_dsa_host"
+                    self.cpu_share_group,
+                    "hisparse_dsa_host",
+                    group_desc=self.cpu_share_group_desc,
                 )
                 if envs.SGLANG_HISPARSE_CPU_SHARE.get()
                 else None
@@ -118,6 +124,20 @@ class HiSparseCoordinator:
             if shared_allocator is not None:
                 self._share_cpu_host_cache = True
                 self._write_host_cache = shared_allocator.is_writer
+                logger.info(
+                    "HiSparse CPU host cache sharing enabled over %s group "
+                    "(world_size=%d, writer=%s).",
+                    self.cpu_share_group_desc,
+                    self.cpu_share_world_size,
+                    self._write_host_cache,
+                )
+            elif envs.SGLANG_HISPARSE_CPU_SHARE.get():
+                logger.info(
+                    "HiSparse CPU host cache sharing requested, but %s group "
+                    "world_size=%d; using a private host cache for this rank.",
+                    self.cpu_share_group_desc,
+                    self.cpu_share_world_size,
+                )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
@@ -446,12 +466,12 @@ class HiSparseCoordinator:
                 break
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            # synchronize TP workers to make sure the same update to scheduler
+        if self.cpu_share_world_size > 1:
+            # synchronize share-group workers to make sure the same update to scheduler
             torch.distributed.all_reduce(
                 queue_size,
                 op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
+                group=self.cpu_share_group,
             )
         finish_count = int(queue_size.item())
         while finish_count > 0:
@@ -632,7 +652,7 @@ class HiSparseCoordinator:
             if self._has_pending_backup:
                 self._backup_done_event.synchronize()
                 self._has_pending_backup = False
-            torch.distributed.barrier(group=self.tp_group)
+            torch.distributed.barrier(group=self.cpu_share_group)
             self._has_pending_shared_backup = False
             return
 
@@ -740,7 +760,7 @@ class HiSparseCoordinator:
 
         if self._write_host_cache:
             self.write_staging_stream.synchronize()
-        torch.distributed.barrier(group=self.tp_group)
+        torch.distributed.barrier(group=self.cpu_share_group)
 
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host + device resources.

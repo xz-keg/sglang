@@ -140,7 +140,8 @@ class TestHiSparseUnit(unittest.TestCase):
             top_k=TOP_K,
             device_buffer_size=DEVICE_BUFFER_SIZE,
             device="cuda",
-            tp_group=cls.tp_group,
+            cpu_share_group=cls.tp_group,
+            cpu_share_group_desc="test",
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
         )
 

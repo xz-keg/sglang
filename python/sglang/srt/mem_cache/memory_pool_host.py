@@ -104,7 +104,7 @@ class HostTensorAllocator:
 
 
 class SharedMemoryHostTensorAllocator(HostTensorAllocator):
-    """Allocate CPU tensors from one mmap shared by a single-node TP group."""
+    """Allocate CPU tensors from one mmap shared by a single-node process group."""
 
     def __init__(
         self,
@@ -219,6 +219,7 @@ class SharedMemoryHostTensorAllocator(HostTensorAllocator):
 def create_shared_memory_host_tensor_allocator(
     group: Optional[Any],
     namespace: str,
+    group_desc: str = "process",
 ) -> Optional[SharedMemoryHostTensorAllocator]:
     if (
         group is None
@@ -234,7 +235,8 @@ def create_shared_memory_host_tensor_allocator(
     torch.distributed.all_gather_object(hostnames, hostname, group=group)
     if len(set(hostnames)) != 1:
         raise RuntimeError(
-            "SGLANG_HISPARSE_CPU_SHARE only supports single-node TP groups. "
+            "SGLANG_HISPARSE_CPU_SHARE only supports single-node "
+            f"{group_desc} groups. "
             f"Got hostnames: {hostnames}."
         )
 

@@ -815,17 +815,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 hisparse_top_k = getattr(
                     self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
                 )
+                if self.server_args.enable_dp_attention:
+                    # DP-attention ranks in different DP groups serve different
+                    # request streams, so host KV sharing is only valid inside
+                    # each DP group's attention-TP shard.
+                    hisparse_cpu_share_group = self.attention_tp_group
+                    hisparse_cpu_share_group_desc = "attention_tp"
+                    if (
+                        envs.SGLANG_HISPARSE_CPU_SHARE.get()
+                        and self.attention_tp_group.world_size == 1
+                    ):
+                        logger.info(
+                            "SGLANG_HISPARSE_CPU_SHARE is enabled with DP attention, "
+                            "but attention_tp_size=1. HiSparse will keep one host "
+                            "cache per DP rank because DP ranks serve different "
+                            "requests."
+                        )
+                else:
+                    hisparse_cpu_share_group = self.tp_group
+                    hisparse_cpu_share_group_desc = "tp"
                 self.hisparse_coordinator = HiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     top_k=hisparse_top_k,
                     device_buffer_size=hisparse_cfg.device_buffer_size,
                     device=self.device,
-                    tp_group=(
-                        self.attention_tp_group.cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_group.cpu_group
-                    ),
+                    cpu_share_group=hisparse_cpu_share_group.cpu_group,
+                    cpu_share_group_desc=hisparse_cpu_share_group_desc,
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
             self.init_attention_backend()
